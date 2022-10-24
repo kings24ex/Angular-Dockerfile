@@ -1,0 +1,544 @@
+Autoscaling, production build and sensitive outputs.
+* Use production build in docker images for angular and vue application and serve the static files built using serve.
+* Change angular ports and vue ports from 4200 and 8080 respectively to 5000 since serve uses it.
+* Add more replicas to angular, react and vue application(1 to 3).
+* Change ingress to use hosts instead of paths for backend forwarding.
+* Remove code that provisions required services in root module since this functionality is now done in terraform_gcp_gke module.
+* Mark google_container_cluster_client_certificate, google_container_cluster_master_auth
+* Add outputs google_container_master_username, google_container_master_password and nginx-ingress-endpoint with the first two having sensitive set to true.
+* Add variables is_http_load_balancing_disabled, is_kubernetes_dashboard_disabled, is_horizontal_pod_autoscaling_disabled, is_istio_disabled, is_cloudrun_disabled, daily_maintenance_start_time, is_vertical_pod_autoscaling_enabled, is_cluster_autoscaling_enabled, cluster_autoscaling_cpu_max_limit, cluster_autoscaling_cpu_min_limit, cluster_autoscaling_memory_max_limit, cluster_autoscaling_memory_min_limit and pass them to terraform_gcp_gke module.
+
+FROM node:11-alpine
+FROM node:11-alpine as builder
+
+COPY package.json yarn.lock /app/
+
+@@ -9,8 +9,15 @@ RUN yarn install
+
+COPY . /app
+
+# RUN yarn run build --prod
+# When yarn is used, it raises API fatal error handler returned after process out of memory on the background thread
+RUN npm run build --prod
+
+CMD yarn run start --host 0.0.0.0
+FROM node:12.2.0-alpine
+
+EXPOSE 4200
+COPY --from=builder /app/dist/ /app/
+
+RUN yarn global add serve
+
+CMD serve -s /app
+
+EXPOSE 5000
+  14  
+Vue/Dockerfile
+@@ -1,4 +1,4 @@
+FROM node:12.2.0-alpine
+FROM node:12.2.0-alpine as builder
+
+COPY package.json /app/
+
+@@ -9,8 +9,14 @@ RUN yarn install
+
+COPY . /app
+
+# RUN yarn run build
+RUN yarn run build
+
+FROM node:12.2.0-alpine
+
+COPY --from=builder /app/dist/ /app/
+
+RUN yarn global add serve
+
+CMD yarn run serve --host 0.0.0.0
+CMD serve -s /app
+
+EXPOSE 8080
+EXPOSE 5000
+  6  
+terraform/angular_service.tf
+@@ -12,8 +12,8 @@ resource "kubernetes_service" "angular-service" {
+    session_affinity = "ClientIP"
+
+    port {
+      port        = 4200
+      target_port = 4200
+      port        = 5000
+      target_port = 5000
+    }
+
+    # type = "LoadBalancer"
+@@ -35,7 +35,7 @@ resource "kubernetes_deployment" "angular-deployment" {
+  }
+
+  spec {
+    replicas          = 1
+    replicas          = 3
+    min_ready_seconds = 10
+
+    selector {
+  119  
+terraform/ingress.tf
+@@ -1,3 +1,14 @@
+data "kubernetes_service" "nginx-ingress-controller" {
+  metadata {
+    name      = "nginx-ingress-controller"
+    namespace = "nginx-ingress"
+  }
+
+  depends_on = [
+    "kubernetes_ingress.turing-devops-ingress",
+  ]
+}
+
+resource "kubernetes_ingress" "turing-devops-ingress" {
+  metadata {
+    name      = "turing-devops-ingress"
+@@ -7,9 +18,9 @@ resource "kubernetes_ingress" "turing-devops-ingress" {
+      "kubernetes.io/ingress.class"              = "nginx"
+      "nginx.ingress.kubernetes.io/ssl-redirect" = "false"
+
+      # "kubernetes.io/tls-acme" = "true"
+      # "certmanager.k8s.io/cluster-issuer" = "letsencrypt-prod"
+      # "certmanager.k8s.io/acme-challenge-type" = "http01"
+      # "kubernetes.io/tls-acme"                   = "true"
+      # "certmanager.k8s.io/cluster-issuer"        = "letsencrypt-prod"
+      # "certmanager.k8s.io/acme-challenge-type"   = "http01"
+    }
+  }
+
+@@ -18,39 +29,66 @@ resource "kubernetes_ingress" "turing-devops-ingress" {
+      # host = "turing.samwelopiyo.guru"
+
+      http {
+
+        path {
+          backend {
+            service_name = "angular-service"
+            service_port = 4200
+            service_name = "vue-service"
+            service_port = 5000
+          }
+
+          path = "/angular/"
+          path = "/"
+        }
+      }
+    }
+
+    rule {
+      host = "angular.turing.samwelopiyo.guru"
+      http {
+        path {
+          backend {
+            service_name = "vue-service"
+            service_port = 8080
+            service_name = "angular-service"
+            service_port = 5000
+          }
+
+          path = "/vue/"
+          path = "/"
+        }
+      }
+    }
+
+    rule {
+      host = "react.turing.samwelopiyo.guru"
+      http {
+        path {
+          backend {
+            service_name = "react-service"
+            service_port = 5000
+          }
+          path = "/"
+        }
+      }
+    }
+
+          path = "/react/"
+    rule {
+      host = "vue.turing.samwelopiyo.guru"
+      http {
+        path {
+          backend {
+            service_name = "vue-service"
+            service_port = 5000
+          }
+          path = "/"
+        }
+      }
+    }
+
+    # tls {
+      # secret_name = "tls-secret"
+      # hosts       = ["turing.samwelopiyo.guru"]
+    # }
+    tls {
+      secret_name = "tls-secret"
+      hosts       = [
+        "turing.samwelopiyo.guru",
+        "vue.turing.samwelopiyo.guru",
+        "angular.turing.samwelopiyo.guru",
+        "react.turing.samwelopiyo.guru",
+      ]
+    }
+  }
+
+  depends_on = [
+@@ -59,55 +97,4 @@ resource "kubernetes_ingress" "turing-devops-ingress" {
+    "kubernetes_service.angular-service",
+    "kubernetes_service.vue-service",
+  ]
+
+  # rule {
+    # host = "react.turing.samwelopiyo.guru"
+    # http {
+      # path {
+        # backend {
+          # service_name = "react-service"
+          # service_port = 5000
+        # }
+
+        # path = "*"
+      # }
+    # }
+  # }
+
+  # rule {
+    # host = "angular.turing.samwelopiyo.guru"
+    # http {
+      # path {
+        # backend {
+          # service_name = "angular-service"
+          # service_port = 4200
+        # }
+
+        # path = "*"
+      # }
+    # }
+  # }
+
+  # rule {
+    # host = "vue.turing.samwelopiyo.guru"
+    # http {
+      # path {
+        # backend {
+          # service_name = "vue-service"
+          # service_port = 8080
+        # }
+
+        # path = "*"
+      # }
+    # }
+  # }
+
+  # tls {
+    # secret_name = "tls-secret"
+    # hosts       = [
+      # "vue.turing.samwelopiyo.guru",
+      # "angular.turing.samwelopiyo.guru",
+      # "react.turing.samwelopiyo.guru",
+    # ]
+  # }
+}
+  37  
+terraform/main.tf
+@@ -15,11 +15,11 @@ provider "kubernetes" {
+}
+
+module "terraform_gcp_gke" {
+  source       = "git::https://github.com/SamwelOpiyo/terraform_gcp_gke//?ref=v0.1.0-beta.3"
+  source       = "git::https://github.com/SamwelOpiyo/terraform_gcp_gke//?ref=v0.1.0-beta.4"
+  region       = "${var.region}"
+  zone         = "${var.zone}"
+  project_name = "${var.project_name}"
+  project_id   = "${google_project_services.project-services.project}" # "${var.project_id}"
+  project_id   = "${var.project_id}"
+
+  cluster_name                  = "${var.cluster_name}"
+  cluster_description           = "${var.cluster_description}"
+@@ -39,28 +39,19 @@ module "terraform_gcp_gke" {
+  service_account_iam_roles     = "${var.cluster_service_account_iam_roles}"
+  kubernetes_logging_service    = "${var.kubernetes_logging_service}"
+  kubernetes_monitoring_service = "${var.kubernetes_monitoring_service}"
+}
+
+resource "google_project_services" "project-services" {
+  project            = "${var.project_id}"
+  disable_on_destroy = "false"
+
+  services = [
+    "cloudresourcemanager.googleapis.com",
+    "servicemanagement.googleapis.com",
+    "serviceusage.googleapis.com",
+    "storage-api.googleapis.com",
+    "iam.googleapis.com",
+    "oslogin.googleapis.com",
+    "compute.googleapis.com",
+    "container.googleapis.com",
+    "containerregistry.googleapis.com",
+    "logging.googleapis.com",
+    "monitoring.googleapis.com",
+    "iamcredentials.googleapis.com",
+    "bigquery-json.googleapis.com",
+    "pubsub.googleapis.com",
+  ]
+  is_http_load_balancing_disabled        = "${var.is_http_load_balancing_disabled}"
+  is_kubernetes_dashboard_disabled       = "${var.is_kubernetes_dashboard_disabled}"
+  is_horizontal_pod_autoscaling_disabled = "${var.is_horizontal_pod_autoscaling_disabled}"
+  is_istio_disabled                      = "${var.is_istio_disabled}"
+  is_cloudrun_disabled                   = "${var.is_cloudrun_disabled}"
+  daily_maintenance_start_time           = "${var.daily_maintenance_start_time}"
+  is_vertical_pod_autoscaling_enabled    = "${var.is_vertical_pod_autoscaling_enabled}"
+  is_cluster_autoscaling_enabled         = "${var.is_cluster_autoscaling_enabled}"
+  cluster_autoscaling_cpu_max_limit      = "${var.cluster_autoscaling_cpu_max_limit}"
+  cluster_autoscaling_cpu_min_limit      = "${var.cluster_autoscaling_cpu_min_limit}"
+  cluster_autoscaling_memory_max_limit   = "${var.cluster_autoscaling_memory_max_limit}"
+  cluster_autoscaling_memory_min_limit   = "${var.cluster_autoscaling_memory_min_limit}"
+}
+
+resource "null_resource" "install-dependencies" {
+  25  
+terraform/outputs.tf
+@@ -19,14 +19,28 @@ output "zone" {
+output "google_container_cluster_cluster_endpoint" {
+  value       = "${module.terraform_gcp_gke.google_container_cluster_cluster_endpoint}"
+  description = "Endpoint for accessing the master node"
+  sensitive   = true
+}
+
+output "google_container_cluster_client_certificate" {
+  value = "${module.terraform_gcp_gke.google_container_cluster_client_certificate}"
+}
+
+output "google_container_cluster_client_key" {
+  value = "${module.terraform_gcp_gke.google_container_cluster_client_key}"
+  value     = "${module.terraform_gcp_gke.google_container_cluster_client_key}"
+  sensitive = true
+}
+
+output "google_container_cluster_master_username" {
+  value       = "${module.terraform_gcp_gke.google_container_cluster_master_username}"
+  description = "Username to authenticate with the k8s master"
+  sensitive   = true
+}
+
+output "google_container_cluster_master_password" {
+  value       = "${module.terraform_gcp_gke.google_container_cluster_master_password}"
+  description = "Password to authenticate with the k8s master"
+  sensitive   = true
+}
+
+output "google_container_cluster_cluster_ca_certificate" {
+@@ -58,7 +72,8 @@ output "google_service_account_cluster_service_account_key_public_key" {
+}
+
+output "google_service_account_cluster_service_account_key_private_key" {
+  value = "${module.terraform_gcp_gke.google_service_account_cluster_service_account_key_private_key}"
+  value     = "${module.terraform_gcp_gke.google_service_account_cluster_service_account_key_private_key}"
+  sensitive = true
+}
+
+output "google_service_account_cluster_service_account_key_valid_after" {
+@@ -122,6 +137,7 @@ output "google_container_cluster_monitoring_service" {
+output "google_container_cluster_master_auth" {
+  value       = "${module.terraform_gcp_gke.google_container_cluster_master_auth}"
+  description = "The authentication information for accessing the Kubernetes master."
+  sensitive   = true
+}
+
+output "google_container_cluster_min_master_version" {
+@@ -191,3 +207,8 @@ output "react_image" {
+  value       = "${kubernetes_deployment.react-deployment.spec[0].template[0].spec[0].container[0].image}"
+  description = "Current React Application Deployed."
+}
+
+output "nginx-ingress-endpoint" {
+  value       = "${data.kubernetes_service.nginx-ingress-controller.load_balancer_ingress[0].ip}"
+  description = "IP of load balancer provisioned for nginx ingress."
+}
+  2  
+terraform/react_service.tf
+@@ -35,7 +35,7 @@ resource "kubernetes_deployment" "react-deployment" {
+  }
+
+  spec {
+    replicas          = 1
+    replicas          = 3
+    min_ready_seconds = 10
+
+    selector {
+  72  
+terraform/variables.tf
+@@ -132,6 +132,78 @@ variable "gke_label_env" {
+  description = "environment"
+}
+
+variable "is_http_load_balancing_disabled" {
+  type        = bool
+  default     = false
+  description = "Status of HTTP (L7) load balancing controller addon, which makes it easy to set up HTTP load balancers for services in a cluster."
+}
+
+variable "is_kubernetes_dashboard_disabled" {
+  type        = bool
+  default     = false
+  description = "Status of the Kubernetes Dashboard add-on, which controls whether the Kubernetes Dashboard will be enabled for this cluster."
+}
+
+variable "is_horizontal_pod_autoscaling_disabled" {
+  type        = bool
+  default     = false
+  description = "Status of the Horizontal Pod Autoscaling addon, which increases or decreases the number of replica pods a replication controller has based on the resource usage of the existing pods. It ensures that a Heapster pod is running in the cluster, which is also used by the Cloud Monitoring service."
+}
+
+variable "is_istio_disabled" {
+  type        = bool
+  default     = true
+  description = "Status of the Istio addon."
+}
+
+variable "is_cloudrun_disabled" {
+  type        = bool
+  default     = true
+  description = "Status of the CloudRun addon. It requires istio_config enabled."
+}
+
+variable "daily_maintenance_start_time" {
+  type        = "string"
+  default     = "12:00"
+  description = "Time window specified for daily maintenance operations. Specify start_time in RFC3339 format 'HH:MM', where HH : [00-23] and MM : [00-59] GMT."
+}
+
+variable "is_vertical_pod_autoscaling_enabled" {
+  type        = bool
+  default     = false
+  description = "Status of Vertical Pod Autoscaling. Vertical Pod Autoscaling automatically adjusts the resources of pods controlled by it."
+}
+
+variable "is_cluster_autoscaling_enabled" {
+  type        = bool
+  default     = false
+  description = "Is node autoprovisioning enabled. To set this to true, make sure your config meets the rest of the requirements. Notably, you'll need min_master_version of at least 1.11.2."
+}
+
+variable "cluster_autoscaling_cpu_max_limit" {
+  type        = number
+  default     = 10
+  description = "Maximum CPU limit for autoscaling if it is enabled."
+}
+
+variable "cluster_autoscaling_cpu_min_limit" {
+  type        = number
+  default     = 1
+  description = "Minimum CPU limit for autoscaling if it is enabled."
+}
+
+variable "cluster_autoscaling_memory_max_limit" {
+  type        = number
+  default     = 64
+  description = "Maximum memory limit for autoscaling if it is enabled."
+}
+
+variable "cluster_autoscaling_memory_min_limit" {
+  type        = number
+  default     = 2
+  description = "Minimum memory limit for autoscaling if it is enabled."
+}
+
+# Service Configurations.
+
+variable "vue_docker_image" {
+  16  
+terraform/variables.tfvars
+@@ -5,9 +5,23 @@ project_id          = "cloud-playground-241611"
+project_name        = "cloud-playground"
+
+gke_node_machine_type      = "n1-standard-1"
+cluster_initial_node_count = 2
+cluster_initial_node_count = 1
+node_locations             = ["europe-west1-b", "europe-west1-c"]
+
+vue_docker_image     = "samwelopiyo/turing_vue:dev.v0.0.1-test"
+angular_docker_image = "samwelopiyo/turing_angular:dev.v0.0.1-test"
+react_docker_image   = "samwelopiyo/turing_react:dev.v0.0.1-test"
+
+
+
+is_http_load_balancing_disabled        = false
+is_kubernetes_dashboard_disabled       = false
+is_horizontal_pod_autoscaling_disabled = false
+is_istio_disabled                      = true
+is_cloudrun_disabled                   = true
+is_vertical_pod_autoscaling_enabled    = false
+is_cluster_autoscaling_enabled         = true
+cluster_autoscaling_cpu_max_limit      = 10
+cluster_autoscaling_cpu_min_limit      = 1
+cluster_autoscaling_memory_max_limit   = 64
+cluster_autoscaling_memory_min_limit   = 2
+  6  
+terraform/vue_service.tf
+@@ -12,8 +12,8 @@ resource "kubernetes_service" "vue-service" {
+    session_affinity = "ClientIP"
+
+    port {
+      port        = 8080
+      target_port = 8080
+      port        = 5000
+      target_port = 5000
+    }
+
+    # type = "LoadBalancer"
+@@ -35,7 +35,7 @@ resource "kubernetes_deployment" "vue-deployment" {
+  }
+
+  spec {
+    replicas          = 1
+    replicas          = 3
+    min_ready_seconds = 10
+
+    selector {
+      match_labels = {
+        app = "vue-app"
+      }
+    }
+    template {
+      metadata {
+        labels = {
+          app  = "vue-app"
+          lang = "vue"
+        }
+      }
+      spec {
+        container {
+          image             = "${var.vue_docker_image}"
+          image_pull_policy = "Always"
+          name              = "vue-container"
+          resources {
+            limits {
+              cpu    = "0.2"
+              memory = "200Mi"
+            }
+            requests {
+              cpu    = "0.1m"
+              memory = "100Mi"
+            }
+          }
+        }
+      }
+    }
+  }
+  depends_on = [
+    "null_resource.install-dependencies",
+    "kubernetes_service.vue-service",
+  ]
+}
+
+
+https://studio.youtube.com/video/QXO59g2TL7s/edit
+
+git@github.com:kings24ex/Angular-Dockerfile.git
